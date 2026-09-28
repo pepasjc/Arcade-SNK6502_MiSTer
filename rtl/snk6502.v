@@ -45,7 +45,12 @@ module snk6502(
 
     // Sound channel 0 mute status (MAME music0_playing — active high when muted).
     // Wired into IN port custom bits at top level.
-    output        music0_playing
+    output        music0_playing,
+
+    // RetroAchievements tap: CPU memory writes (clk_master, single-clock strobe)
+    output        ra_wr,
+    output [15:0] ra_addr,
+    output  [7:0] ra_dout
 );
 
 // Game IDs
@@ -145,6 +150,10 @@ T65 cpu(
 );
 
 // ---------------------------------------------------------------------------
+assign ra_wr   = ~cpu_rw_n & cpu_clken;
+assign ra_addr = cpu_addr;
+assign ra_dout = cpu_dout;
+
 // Program ROM - 64KB (sparse, loaded by .mra at correct addresses)
 // ---------------------------------------------------------------------------
 wire [7:0] rom_dout;

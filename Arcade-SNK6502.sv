@@ -50,15 +50,27 @@ assign BUTTONS = '0;
 
 wire [1:0] ar = status[20:19];
 
-assign VIDEO_ARX = (!ar) ? (status[2] ? 8'd4 : 8'd3) : (ar - 1'd1);
-assign VIDEO_ARY = (!ar) ? (status[2] ? 8'd3 : 8'd4) : 12'd0;
+// When the rotated frame buffer is cropped to the scaler's output height (see
+// "Rotated frame buffer crop" at the end), "Original" keeps the 3:4 geometry
+// of the full picture: h of H lines of a 3:4 frame are 3H:4h wide:high
+// (224x256 cropped to 240 lines -> 768:960). Lines still map 1:1; only the
+// width is scaled. [ARC1] = 224:<lines> gives square pixels.
+reg         fb_crop = 1'b0;
+wire [11:0] rot_fb_height;
+wire [31:0] rot_fb_base;
+wire [11:0] fb_arx_crop = rot_fb_height * 2'd3;
+wire [11:0] fb_ary_crop = {FB_HEIGHT[9:0], 2'b00};
+
+assign VIDEO_ARX = (!ar) ? (fb_crop ? fb_arx_crop : (status[2] ? 12'd4 : 12'd3)) : (ar - 1'd1);
+assign VIDEO_ARY = (!ar) ? (fb_crop ? fb_ary_crop : (status[2] ? 12'd3 : 12'd4)) : 12'd0;
 
 `include "build_id.v"
 localparam CONF_STR = {
-	"SNK6502;;",
+	"RA_SNK6502;;",
 	"P1,Video Options;",
 	"H0P1OJK,Aspect Ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"H0P1O2,Orientation,Vert,Horz;",
+	"H0P1OC,Rotated Height,Crop to Output,Scale;",
 	"P1OB,HDMI Flip,Off,On;",
 	"P1O35,Scandoubler Fx,None,HQ2x,CRT 25%,CRT 50%,CRT 75%;",
 	"-;",
@@ -388,6 +400,11 @@ wire        dbg_crtc_hit;
 wire        dbg_cpu_active;
 wire        music0_playing;   // MAME custom bit — high when sound ch0 is muted
 
+// RetroAchievements tap (see RETROACHIEVEMENTS at the end)
+wire        ra_cpu_wr;
+wire [15:0] ra_cpu_addr;
+wire  [7:0] ra_cpu_dout;
+
 snk6502 game_core(
 	.clk_master (clk_master),
 	.clk_sys    (clk_sys),
@@ -417,7 +434,11 @@ snk6502 game_core(
 	.flip_screen(core_flip),
 	.ce_pix     (ce_pix),
 
-	.music0_playing(music0_playing)
+	.music0_playing(music0_playing),
+
+	.ra_wr      (ra_cpu_wr),
+	.ra_addr    (ra_cpu_addr),
+	.ra_dout    (ra_cpu_dout)
 );
 
 // DISPLAY
@@ -438,7 +459,67 @@ wire no_rotate = status[2] | direct_video;
 wire rotate_ccw = 0;
 wire flip = status[11];
 
-screen_rotate screen_rotate (.*);
+// The rotation framebuffer shares the DDR port with the RetroAchievements
+// mirror (see the end of the file), so its DDRAM outputs go through a mux;
+// FB_HEIGHT/FB_BASE go through the crop below.
+wire  [7:0] rot_burstcnt, rot_be;
+wire [28:0] rot_addr;
+wire [63:0] rot_din;
+wire        rot_we, rot_rd;
+
+screen_rotate screen_rotate
+(
+	.*,
+	.FB_HEIGHT(rot_fb_height),
+	.FB_BASE(rot_fb_base),
+	.DDRAM_CLK(),
+	.DDRAM_BURSTCNT(rot_burstcnt),
+	.DDRAM_ADDR(rot_addr),
+	.DDRAM_DIN(rot_din),
+	.DDRAM_BE(rot_be),
+	.DDRAM_WE(rot_we),
+	.DDRAM_RD(rot_rd)
+);
+
+// ---- Rotated frame buffer crop ----
+// Rotated, the picture is 256 lines tall in screen_rotate's frame buffer
+// (224x256). When the scaler's active output height (HDMI_HEIGHT, 0 in direct
+// video) is smaller -- e.g. a 240-line 15 kHz video_mode -- ascal would shrink
+// 256 lines to fit with nearest-neighbour line drops, which shimmer when the
+// picture scrolls. Instead report only the middle HDMI_HEIGHT lines:
+// FB_HEIGHT = the visible lines and FB_BASE moved down by the top margin, so
+// ascal reads them 1:1. The rotator still writes whole frames into each of its
+// three 8 MB pages; the offset is added to whichever page base it currently
+// presents, so its triple/double buffering is unaffected. Not rotated
+// (including HDMI Flip alone), direct video and outputs >= the frame height
+// are unchanged. OSD "Rotated Height" = Scale restores the old behaviour. The
+// rotator's clock (CLK_VIDEO) is clk_vid. (Same change as the RA forks of the
+// Psikyo, Raiden II, Cave and Taito Asuka cores.)
+reg  [11:0] fb_out_h_s0 = 12'd0, fb_out_h_s1 = 12'd0, fb_out_h_s2 = 12'd0;
+reg  [11:0] fb_out_h = 12'd0;
+reg  [11:0] fb_crop_h = 12'd0;
+reg  [11:0] fb_crop_lines = 12'd0;
+reg  [25:0] fb_crop_offset = 26'd0;
+reg  [31:0] fb_base_r = 32'd0;
+
+always @(posedge clk_vid) begin
+	// HDMI_HEIGHT comes from sys's clk_vid domain; it only changes on a video
+	// mode change, so take it once it has been stable for two samples.
+	fb_out_h_s0 <= HDMI_HEIGHT;
+	fb_out_h_s1 <= fb_out_h_s0;
+	fb_out_h_s2 <= fb_out_h_s1;
+	if (fb_out_h_s1 == fb_out_h_s2) fb_out_h <= fb_out_h_s2;
+
+	fb_crop <= ~status[12] & ~no_rotate &
+	           (fb_out_h != 12'd0) & (fb_out_h < rot_fb_height);
+	fb_crop_h <= fb_out_h;
+	fb_crop_lines <= (rot_fb_height - fb_out_h) >> 1;
+	fb_crop_offset <= fb_crop_lines * FB_STRIDE;
+	fb_base_r <= rot_fb_base + (fb_crop ? {6'd0, fb_crop_offset} : 32'd0);
+end
+
+assign FB_HEIGHT = fb_crop ? fb_crop_h : rot_fb_height;
+assign FB_BASE   = fb_base_r;
 
 arcade_video #(256,9,1) arcade_video
 (
@@ -461,5 +542,73 @@ assign CLK_VIDEO = clk_vid;
 assign AUDIO_L = core_audio;
 assign AUDIO_R = core_audio;
 assign AUDIO_S = 1'b1;
+
+///////////////////   RETROACHIEVEMENTS   ///////////////////
+//
+// RAM mirror for the RetroAchievements fork of Main_MiSTer. FinalBurn Neo's
+// d_snk6502.cpp "All Ram" block is the CPU's own 0x0000-0x1FFF (work RAM,
+// video RAM 2, video RAM, colour RAM, character RAM, in that order), so every
+// 6502 write below 0x2000 is shadowed byte for byte at its CPU address
+// (rtl/ra/ra_shadow.v, written on clk_master, read on clk_vid) and copied to
+// DDR3 at 0x3D000000 once per frame in the "RACH" layout the RA build of
+// Main_MiSTer reads (rtl/ra/ra_mirror_gather.v, from jotego's JTFRAME
+// jtframe_ra_mirror.v). ARM region table: identity { 0x0000, 0x2000, 0x0000 }.
+//
+// The only other DDR client is the screen rotation framebuffer, which ignores
+// DDRAM_BUSY and writes one pixel per CE_PIXEL while VGA_DE is high. So a copy
+// only starts once VGA_DE has been low for 4096 clk_vid clocks (91 us, longer
+// than any HBlank): the copy (1k qwords, ~60 us) then runs inside the VBlank.
+// Held off during ROM download.
+reg        ra_wr;
+reg [11:0] ra_word;
+reg [15:0] ra_din;
+reg  [1:0] ra_be;
+always @(posedge clk_master) begin
+	ra_wr   <= ra_cpu_wr && ra_cpu_addr[15:13] == 3'b000;
+	ra_word <= ra_cpu_addr[12:1];
+	ra_din  <= {ra_cpu_dout, ra_cpu_dout};
+	ra_be   <= ra_cpu_addr[0] ? 2'b10 : 2'b01;
+end
+
+wire  [9:0] ra_rd_q;
+wire [63:0] ra_q;
+ra_shadow #(.AW(13)) ra_shadow
+(
+	.clk_w(clk_master), .wr(ra_wr), .wr_word(ra_word), .wr_din(ra_din), .wr_be(ra_be),
+	.clk_r(clk_vid), .rd_q(ra_rd_q), .q(ra_q)
+);
+
+reg [11:0] ra_de_idle = 0;
+always @(posedge clk_vid) begin
+	if (VGA_DE) ra_de_idle <= 0;
+	else if (~&ra_de_idle) ra_de_idle <= ra_de_idle + 1'd1;
+end
+
+reg [2:0] ra_dl_s = 0;
+always @(posedge clk_vid) ra_dl_s <= {ra_dl_s[1:0], ioctl_download};
+
+wire [12:0] ra_rd_addr;
+wire  [7:0] ra_burstcnt, ra_ddr_be;
+wire [28:0] ra_addr;
+wire [63:0] ra_ddr_din;
+wire        ra_we, ra_active;
+assign ra_rd_q = ra_rd_addr[9:0];
+
+ra_mirror_gather #(.DW(64), .RD_LAT(1), .BLOCKS(32)) ra_mirror
+(
+	.rst(~pll_locked), .clk(clk_vid),
+	.vblank(&ra_de_idle), .hold(ra_dl_s[2]),
+	.rd_en(), .rd_addr(ra_rd_addr), .rd_data(ra_q),
+	.ddr_we(ra_we), .ddr_busy(DDRAM_BUSY), .ddr_burstcnt(ra_burstcnt),
+	.ddr_addr(ra_addr), .ddr_be(ra_ddr_be), .ddr_din(ra_ddr_din), .active(ra_active)
+);
+
+assign DDRAM_CLK      = clk_vid;
+assign DDRAM_BURSTCNT = ra_active ? ra_burstcnt : rot_burstcnt;
+assign DDRAM_ADDR     = ra_active ? ra_addr     : rot_addr;
+assign DDRAM_DIN      = ra_active ? ra_ddr_din  : rot_din;
+assign DDRAM_BE       = ra_active ? ra_ddr_be   : rot_be;
+assign DDRAM_WE       = ra_active ? ra_we       : rot_we;
+assign DDRAM_RD       = ra_active ? 1'b0        : rot_rd;
 
 endmodule

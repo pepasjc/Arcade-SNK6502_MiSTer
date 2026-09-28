@@ -15,3 +15,5 @@ set_global_assignment -name VERILOG_FILE rtl/sound/hd38880/hd38880_dectab.v
 set_global_assignment -name VERILOG_FILE rtl/sound/hd38880/parcor_lattice.v
 set_global_assignment -name VERILOG_FILE rtl/sound/hd38880/hd38880_top.v
 set_global_assignment -name VHDL_FILE rtl/ram_rom/dpram_dc.vhd
+set_global_assignment -name VERILOG_FILE rtl/ra/ra_shadow.v
+set_global_assignment -name VERILOG_FILE rtl/ra/ra_mirror_gather.v
